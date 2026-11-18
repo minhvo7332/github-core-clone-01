@@ -15,7 +15,7 @@
 //     and a non-fast-forward update is refused with exactly `non-fast-forward`.
 //   - Packs carry plain objects only, no deltas; the trailer is SHA-1.
 
-import type { IncomingMessage, ServerResponse } from 'node:http';
+import type { TransportRequest, TransportResponse } from './transport.ts';
 import { AGENT, PKT_DELIM, PKT_FLUSH, ZERO_OID, isSha1, pktLine, pktTextLines, readPktLines } from './util.ts';
 import { parseCommit, parseTag, parseTree, type Repo, type Store } from './store.ts';
 
@@ -34,7 +34,7 @@ const V2_CAPS: Array<[string, string]> = [
 const V0_UPLOAD_CAPS = `symref=HEAD:refs/heads/main side-band-64k thin-pack ofs-delta shallow multi_ack agent=${AGENT}`;
 const V0_RECEIVE_CAPS = `report-status side-band-64k delete-refs ofs-delta agent=${AGENT}`;
 
-export function sendBuffer(res: ServerResponse, status: number, body: Buffer, contentType: string): void {
+export function sendBuffer(res: TransportResponse, status: number, body: Buffer, contentType: string): void {
   res.writeHead(status, { 'content-type': contentType, 'content-length': body.length });
   res.end(body);
 }
@@ -294,14 +294,14 @@ function v0FetchResponse(store: Store, repo: Repo, plan: FetchPlan): Buffer {
 }
 
 /** Handle GET /{owner}/{repo}.git/info/refs?service=... */
-export function handleInfoRefs(store: Store, owner: string, repoName: string, req: IncomingMessage, res: ServerResponse, service: string | null): void {
+export function handleInfoRefs(store: Store, owner: string, repoName: string, req: TransportRequest, res: TransportResponse, service: string | null): void {
   const repo = store.getRepo(owner, repoName);
   if (repo === undefined) {
     res.writeHead(404, { 'content-type': 'application/json; charset=utf-8' });
     res.end(JSON.stringify({ message: 'Not Found' }));
     return;
   }
-  const wantsV2 = service === 'git-upload-pack' && (req.headers['git-protocol'] ?? '') === 'version=2';
+  const wantsV2 = service === 'git-upload-pack' && (req.headers.get('git-protocol') ?? '') === 'version=2';
   if (service === 'git-upload-pack') {
     if (wantsV2) sendBuffer(res, 200, v2Advertisement(), UPLOAD_AD);
     else sendBuffer(res, 200, v0Advertisement(store, repo, 'git-upload-pack'), UPLOAD_AD);
@@ -314,14 +314,14 @@ export function handleInfoRefs(store: Store, owner: string, repoName: string, re
 }
 
 /** Handle POST /{owner}/{repo}.git/git-upload-pack (v2 ls-refs/fetch, or v0 fetch). */
-export function handleUploadPack(store: Store, owner: string, repoName: string, req: IncomingMessage, res: ServerResponse, body: Buffer): void {
+export function handleUploadPack(store: Store, owner: string, repoName: string, req: TransportRequest, res: TransportResponse, body: Buffer): void {
   const repo = store.getRepo(owner, repoName);
   if (repo === undefined) {
     res.writeHead(404, { 'content-type': 'application/json; charset=utf-8' });
     res.end(JSON.stringify({ message: 'Not Found' }));
     return;
   }
-  const isV2 = (req.headers['git-protocol'] ?? '') === 'version=2';
+  const isV2 = (req.headers.get('git-protocol') ?? '') === 'version=2';
   const lines = pktTextLines(body);
   if (isV2) {
     const command = lines.find((line) => line.startsWith('command='))?.slice(8).trim() ?? '';
@@ -376,7 +376,7 @@ export function handleUploadPack(store: Store, owner: string, repoName: string, 
 }
 
 /** Handle POST /{owner}/{repo}.git/git-receive-pack (v0 only). */
-export function handleReceivePack(store: Store, owner: string, repoName: string, req: IncomingMessage, res: ServerResponse, body: Buffer): void {
+export function handleReceivePack(store: Store, owner: string, repoName: string, req: TransportRequest, res: TransportResponse, body: Buffer): void {
   const repo = store.getRepo(owner, repoName);
   if (repo === undefined) {
     res.writeHead(404, { 'content-type': 'application/json; charset=utf-8' });
@@ -413,9 +413,10 @@ export function handleReceivePack(store: Store, owner: string, repoName: string,
   if (packBytes.length > 0) {
     try {
       const entries = store.readPack(packBytes);
-      for (const entry of entries) store.putObject(entry.type, entry.data);
+      for (const entry of entries) store.putObject(entry.type, entry.data, entry.oid);
       // A ref update invalidates the cached depth-1 pack for its old tip.
       store.depth1PackCache.clear();
+      store.packCache.clear();
     } catch (err) {
       unpackOk = false;
       unpackDetail = err instanceof Error ? err.message : 'unpack failed';

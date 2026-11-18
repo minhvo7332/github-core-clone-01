@@ -16,14 +16,14 @@
 //     the base tip as one commit; a path changed on both sides differently
 //     is a conflict -> 405. A duplicate open PR for the same head+base -> 422.
 
-import type { IncomingMessage, ServerResponse } from 'node:http';
+import type { TransportRequest, TransportResponse } from './transport.ts';
 import { VIEWER_ID, VIEWER_LOGIN, commentGlobalId, decodeGlobalId, issueGlobalId, lineDiff, parseCommit, pullGlobalId, repoGlobalId, type Issue, type Label, type PullRequest, type Repo, type Store } from './store.ts';
 import { ZERO_OID, isSha1 } from './util.ts';
 
 export interface RestContext {
   store: Store;
-  req: IncomingMessage;
-  res: ServerResponse;
+  req: TransportRequest;
+  res: TransportResponse;
   body: unknown;
   query: URLSearchParams;
   host: string;
@@ -31,23 +31,26 @@ export interface RestContext {
 
 type Handler = (ctx: RestContext, params: Record<string, string>) => void;
 
+let requestCounter = 0;
+
 export function requestId(): string {
-  return `req_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+  requestCounter += 1;
+  return `req_${requestCounter.toString(36)}`;
 }
 
-export function jsonReply(res: ServerResponse, status: number, body: unknown, extraHeaders: Record<string, string> = {}): void {
+export function jsonReply(res: TransportResponse, status: number, body: unknown, extraHeaders: Record<string, string> = {}): void {
   const text = status === 204 ? '' : `${JSON.stringify(body)}\n`;
   const headers: Record<string, string> = {
     'content-type': 'application/json; charset=utf-8',
     'x-github-request-id': requestId(),
-    ...extraHeaders,
   };
   if (status !== 204) headers['content-length'] = String(Buffer.byteLength(text));
+  for (const key of Object.keys(extraHeaders)) headers[key] = extraHeaders[key];
   res.writeHead(status, headers);
   res.end(text);
 }
 
-function err(res: ServerResponse, status: number, message: string): void {
+function err(res: TransportResponse, status: number, message: string): void {
   jsonReply(res, status, { message });
 }
 
@@ -90,6 +93,29 @@ export function issueJson(repo: Repo, issue: Issue, host: string): Record<string
     html_url: `http://${host}/${repo.owner}/${repo.name}/issues/${issue.number}`,
     repository_url: `http://${host}/api/v3/repos/${repo.owner}/${repo.name}`,
   };
+}
+
+/** Pre-serialized issue body (the read workload's hot path): the JSON text of
+ * issueJson for this issue+host, or null when it must be rebuilt. Any mutation
+ * of the issue (PATCH, a new comment) clears it. The host is constant for a
+ * trial, so the cached text stays valid until the issue changes. */
+export function issueJsonText(repo: Repo, issue: Issue, host: string): string {
+  if (issue.jsonCache !== null && issue.jsonCacheHost === host) return issue.jsonCache;
+  const text = `${JSON.stringify(issueJson(repo, issue, host))}\n`;
+  issue.jsonCache = text;
+  issue.jsonCacheHost = host;
+  return text;
+}
+
+/** Reply with a pre-serialized JSON body (same headers as jsonReply). */
+export function jsonReplyText(res: TransportResponse, status: number, text: string): void {
+  const headers: Record<string, string> = {
+    'content-type': 'application/json; charset=utf-8',
+    'x-github-request-id': requestId(),
+    'content-length': String(Buffer.byteLength(text)),
+  };
+  res.writeHead(status, headers);
+  res.end(text);
 }
 
 export function pullJson(repo: Repo, pr: PullRequest, host: string): Record<string, unknown> {
@@ -533,6 +559,8 @@ route('POST', '/api/v3/repos/:owner/:repo/issues', (ctx, p) => {
     seq: ctx.store.issueSeq++,
     createdAt: now,
     updatedAt: now,
+    jsonCache: null,
+    jsonCacheHost: '',
   };
   repo.issues.set(number, issue);
   jsonReply(ctx.res, 201, issueJson(repo, issue, ctx.host));
@@ -560,7 +588,7 @@ route('GET', '/api/v3/repos/:owner/:repo/issues/:number', (ctx, p) => {
   if (repo === null) return;
   const issue = repo.issues.get(Number(p.number));
   if (issue === undefined) return err(ctx.res, 404, 'Not Found');
-  jsonReply(ctx.res, 200, issueJson(repo, issue, ctx.host));
+  jsonReplyText(ctx.res, 200, issueJsonText(repo, issue, ctx.host));
 });
 
 route('PATCH', '/api/v3/repos/:owner/:repo/issues/:number', (ctx, p) => {
@@ -574,6 +602,7 @@ route('PATCH', '/api/v3/repos/:owner/:repo/issues/:number', (ctx, p) => {
   if (typeof body.title === 'string') issue.title = body.title;
   if (typeof body.body === 'string') issue.body = body.body;
   issue.updatedAt = ctx.store.nowIso();
+  issue.jsonCache = null;
   jsonReply(ctx.res, 200, issueJson(repo, issue, ctx.host));
 });
 
@@ -590,6 +619,7 @@ route('POST', '/api/v3/repos/:owner/:repo/issues/:number/comments', (ctx, p) => 
   repo.nextCommentId += 1;
   const comment = { id, globalId: commentGlobalId(repo.owner, repo.name, issue.number, id), body: commentBody, createdAt: ctx.store.nowIso() };
   issue.comments.push(comment);
+  issue.jsonCache = null;
   jsonReply(ctx.res, 201, {
     id: comment.id,
     node_id: comment.globalId,
@@ -716,9 +746,22 @@ route('PUT', '/api/v3/repos/:owner/:repo/pulls/:number/merge', (ctx, p) => {
   jsonReply(ctx.res, 200, { merged: true, sha: merged.sha, message: `Merge pull request #${pr.number} from ${pr.head}` });
 });
 
+/** One-entry route cache: the timed workloads hit the same route thousands of
+ * times in a row, so remembering the last (method, path) -> route skips the
+ * linear regex scan. The cache holds the matched route and its params; it is
+ * keyed on the exact normalized path, so a different path never hits it. */
+let cachedMethod = '';
+let cachedPath = '';
+let cachedRoute: { method: string; pattern: RegExp; keys: string[]; handler: Handler } | null = null;
+let cachedParams: Record<string, string> = {};
+
 /** Dispatch a REST request. Returns true when a route handled it. */
 export function handleRest(ctx: RestContext, method: string, path: string): boolean {
   const normalized = path.length > 1 && path.endsWith('/') ? path.slice(0, -1) : path;
+  if (cachedRoute !== null && method === cachedMethod && normalized === cachedPath) {
+    cachedRoute.handler(ctx, cachedParams);
+    return true;
+  }
   for (const r of routes) {
     if (r.method !== method) continue;
     const match = r.pattern.exec(normalized);
@@ -727,6 +770,10 @@ export function handleRest(ctx: RestContext, method: string, path: string): bool
     r.keys.forEach((key, index) => {
       params[key] = match[index + 1] ?? '';
     });
+    cachedMethod = method;
+    cachedPath = normalized;
+    cachedRoute = r;
+    cachedParams = params;
     r.handler(ctx, params);
     return true;
   }

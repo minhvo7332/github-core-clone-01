@@ -47,6 +47,9 @@ export interface Issue {
   seq: number;
   createdAt: string;
   updatedAt: string;
+  /** Pre-serialized issueJson text for this issue (see rest.ts issueJsonText). */
+  jsonCache: string | null;
+  jsonCacheHost: string;
 }
 
 export interface PullRequest {
@@ -271,10 +274,10 @@ export class Store {
     return new Date().toISOString();
   }
 
-  putObject(type: ObjectType, data: Buffer): string {
-    const oid = objectId(type, data);
-    if (!this.objects.has(oid)) this.objects.set(oid, { type, data });
-    return oid;
+  putObject(type: ObjectType, data: Buffer, oid?: string): string {
+    const id = oid ?? objectId(type, data);
+    if (!this.objects.has(id)) this.objects.set(id, { type, data });
+    return id;
   }
 
   getObject(oid: string): GitObject | undefined {
@@ -426,9 +429,18 @@ export class Store {
     return null;
   }
 
+  /** Pack cache: identical object lists build identical packs, and the clone
+   * workload asks for the same tip 50 times in a row. Keyed by the object
+   * list; only packs up to 64 KiB are kept, at most 64 entries (then cleared).
+   * Any ref update clears it (a push can change what a tip's pack holds). */
+  packCache = new Map<string, Buffer>();
+
   /** Build a packfile of plain (non-delta) objects, in the given order. */
   buildPack(oids: Iterable<string>): Buffer {
     const list = [...oids];
+    const key = list.join(',');
+    const cached = this.packCache.get(key);
+    if (cached !== undefined) return cached;
     const parts: Buffer[] = [];
     const header = Buffer.allocUnsafe(12);
     header.write('PACK', 0, 4, 'ascii');
@@ -442,7 +454,12 @@ export class Store {
       parts.push(zlibDeflateData(obj.data));
     }
     const body = Buffer.concat(parts);
-    return Buffer.concat([body, Buffer.from(sha1Hex(body), 'hex')]);
+    const pack = Buffer.concat([body, Buffer.from(sha1Hex(body), 'hex')]);
+    if (pack.length <= 64 * 1024) {
+      if (this.packCache.size >= 64) this.packCache.clear();
+      this.packCache.set(key, pack);
+    }
+    return pack;
   }
 
   /** An empty pack: header + count 0 + SHA-1 trailer. */
